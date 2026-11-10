@@ -41,9 +41,15 @@ if (-not (Test-Path $adb)) {
 }
 
 function Healthy {
-    Start-Sleep 4; $a = (Tv "pidof $me"); Start-Sleep 3; $b = (Tv "pidof $me")
-    $focus = (Tv 'dumpsys window | grep -m1 mCurrentFocus')
-    return ($a -and $a -eq $b -and "$focus" -like "*$me*")
+    # Sampai 3 kali: saat Glass TV yang sudah jadi Home diperbarui, Android menjalankannya ulang sendiri
+    # sekali, sehingga nomor prosesnya berganti di percobaan pertama walau aplikasinya sehat.
+    for ($try = 1; $try -le 3; $try++) {
+        Start-Sleep 4; $a = (Tv "pidof $me"); Start-Sleep 3; $b = (Tv "pidof $me")
+        $focus = (Tv 'dumpsys window | grep -m1 mCurrentFocus')
+        if ($a -and $a -eq $b -and "$focus" -like "*$me*") { return $true }
+        if ($try -lt 3) { Tv "am start -n $me/.MainActivity" | Out-Null }
+    }
+    return $false
 }
 function Undo([string]$why) {
     Write-Host "GAGAL: $why. Mengembalikan launcher bawaan..."
