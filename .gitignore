@@ -1,5 +1,3 @@
-# Kode Glass TV yang di-clone saat Langkah 3, dan hasil backup TV (berisi data perangkat pribadi)
+# Kode Glass TV yang di-clone saat build sendiri, dan hasil backup TV (berisi data perangkat pribadi)
 glass-tv/
 backup-sony-*/
-# File adzan pribadi jangan ikut di-commit
-*.mp3
