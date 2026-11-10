@@ -1,0 +1,3156 @@
+diff --git a/launcher/app/src/main/AndroidManifest.xml b/launcher/app/src/main/AndroidManifest.xml
+index a17f810..dd64e9b 100644
+--- a/launcher/app/src/main/AndroidManifest.xml
++++ b/launcher/app/src/main/AndroidManifest.xml
+@@ -13,6 +13,14 @@
+     <!-- Needed on Android 10 to read the Wi-Fi network name; granted over adb at install time. -->
+     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+ 
++    <!-- Adzan: peringatan di atas aplikasi lain, alarm tepat waktu, dan jadwal ulang saat TV menyala. -->
++    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
++    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
++    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
++    <uses-permission android:name="android.permission.WAKE_LOCK" />
++
+     <!-- Android 11+ package visibility: lets the launcher list the TV apps it shows as tiles, and the
+          apps that declare a module card (docs/specs/card.md). -->
+     <queries>
+@@ -95,6 +103,23 @@
+             </intent-filter>
+         </service>
+ 
++        <!-- Adzan: alarm internal, kejadian sistem, dan layanan yang menampilkan peringatan/adzan. -->
++        <receiver android:name=".AdzanReceiver" android:exported="false" />
++        <receiver android:name=".AdzanSystemReceiver" android:exported="true">
++            <intent-filter>
++                <action android:name="android.intent.action.BOOT_COMPLETED" />
++                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
++                <action android:name="android.intent.action.TIME_SET" />
++                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
++                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
++                <action android:name="com.gathin.tvhome.ADZAN_PREVIEW" />
++            </intent-filter>
++        </receiver>
++        <service
++            android:name=".AdzanService"
++            android:exported="false"
++            android:foregroundServiceType="mediaPlayback" />
++
+         <!-- The remote's Input button (KEYCODE_TV) opens the input switcher; see InputKeyService. -->
+         <service
+             android:name=".InputKeyService"
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/AdzanReceiver.java b/launcher/app/src/main/java/com/gathin/tvhome/AdzanReceiver.java
+new file mode 100644
+index 0000000..4f75c08
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/AdzanReceiver.java
+@@ -0,0 +1,21 @@
++package com.gathin.tvhome;
++
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++
++/**
++ * Menerima alarm adzan (lalu menyalakan {@link AdzanService}) dan kejadian sistem yang membuat
++ * jadwal perlu dihitung ulang: TV baru menyala, jam/zona waktu diubah, atau aplikasi diperbarui.
++ */
++public class AdzanReceiver extends BroadcastReceiver {
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++        if (AdzanScheduler.ACTION_FIRE.equals(intent.getAction())) {
++            Intent s = new Intent(context, AdzanService.class).putExtras(intent);
++            context.startForegroundService(s);
++        }
++        AdzanScheduler.scheduleNext(context);
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/AdzanScheduler.java b/launcher/app/src/main/java/com/gathin/tvhome/AdzanScheduler.java
+new file mode 100644
+index 0000000..8e7e2ee
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/AdzanScheduler.java
+@@ -0,0 +1,76 @@
++package com.gathin.tvhome;
++
++import android.app.AlarmManager;
++import android.app.PendingIntent;
++import android.content.Context;
++import android.content.Intent;
++import android.util.Log;
++
++import java.util.Calendar;
++
++/**
++ * Menjadwalkan peringatan 5 menit sebelum adzan dan suara adzan, untuk Dzuhur, Ashar, Maghrib dan
++ * Isya (Subuh dilewati). Hanya satu alarm yang aktif: kejadian berikutnya. Setiap kali alarm
++ * berbunyi, {@link AdzanReceiver} menjadwalkan kejadian sesudahnya.
++ */
++final class AdzanScheduler {
++
++    static final String TAG = "Adzan";
++    static final String ACTION_FIRE = "com.gathin.tvhome.ADZAN_FIRE";
++    static final String EXTRA_KIND = "kind";       // "warn" atau "adzan"
++    static final String EXTRA_PRAYER = "prayer";   // indeks PrayerTimes.NAMES
++    static final String EXTRA_MINUTE = "minute";   // menit sejak 00:00 waktu sholatnya
++    static final int WARN_BEFORE_MIN = 5;
++    /** Indeks waktu sholat yang diberi peringatan dan adzan: Dzuhur, Ashar, Maghrib, Isya. */
++    private static final int[] PRAYERS = {1, 2, 3, 4};
++
++    private AdzanScheduler() {}
++
++    static void scheduleNext(Context context) {
++        Config cfg = Config.load(context);
++        if (!cfg.prayerTimes) return;
++        long now = System.currentTimeMillis();
++        long bestAt = Long.MAX_VALUE;
++        String bestKind = null;
++        int bestPrayer = -1, bestMinute = 0;
++        for (int dayOffset = 0; dayOffset <= 1; dayOffset++) {
++            Calendar day = Calendar.getInstance();
++            day.add(Calendar.DAY_OF_YEAR, dayOffset);
++            int[] t = PrayerTimes.forDay(day, cfg.prayerLat, cfg.prayerLng, cfg.prayerIhtiyat);
++            for (int p : PRAYERS) {
++                for (int k = 0; k < 2; k++) {
++                    int minute = t[p] - (k == 0 ? WARN_BEFORE_MIN : 0);
++                    Calendar at = (Calendar) day.clone();
++                    at.set(Calendar.HOUR_OF_DAY, 0);
++                    at.set(Calendar.MINUTE, 0);
++                    at.set(Calendar.SECOND, 0);
++                    at.set(Calendar.MILLISECOND, 0);
++                    at.add(Calendar.MINUTE, minute);
++                    long ms = at.getTimeInMillis();
++                    if (ms > now + 1000 && ms < bestAt) {
++                        bestAt = ms;
++                        bestKind = k == 0 ? "warn" : "adzan";
++                        bestPrayer = p;
++                        bestMinute = t[p];
++                    }
++                }
++            }
++        }
++        if (bestKind == null) return;
++        Intent i = new Intent(context, AdzanReceiver.class).setAction(ACTION_FIRE)
++                .putExtra(EXTRA_KIND, bestKind)
++                .putExtra(EXTRA_PRAYER, bestPrayer)
++                .putExtra(EXTRA_MINUTE, bestMinute);
++        PendingIntent pi = PendingIntent.getBroadcast(context, 1, i,
++                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
++        AlarmManager am = context.getSystemService(AlarmManager.class);
++        try {
++            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, bestAt, pi);
++        } catch (SecurityException e) {
++            // Android 12+ tanpa izin alarm tepat: tetap dijadwalkan, mungkin meleset beberapa menit.
++            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, bestAt, pi);
++        }
++        Log.i(TAG, "next " + bestKind + " " + PrayerTimes.NAMES[bestPrayer] + " at "
++                + android.text.format.DateFormat.format("yyyy-MM-dd HH:mm:ss", bestAt));
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/AdzanService.java b/launcher/app/src/main/java/com/gathin/tvhome/AdzanService.java
+new file mode 100644
+index 0000000..7c6d54f
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/AdzanService.java
+@@ -0,0 +1,272 @@
++package com.gathin.tvhome;
++
++import android.app.Notification;
++import android.app.NotificationChannel;
++import android.app.NotificationManager;
++import android.app.Service;
++import android.content.Context;
++import android.content.Intent;
++import android.graphics.PixelFormat;
++import android.media.AudioAttributes;
++import android.media.AudioFocusRequest;
++import android.media.AudioManager;
++import android.media.MediaPlayer;
++import android.os.IBinder;
++import android.provider.Settings;
++import android.util.DisplayMetrics;
++import android.util.Log;
++import android.view.Gravity;
++import android.view.KeyEvent;
++import android.view.View;
++import android.view.WindowManager;
++import android.widget.FrameLayout;
++import android.widget.TextView;
++
++/**
++ * Peringatan 5 menit sebelum adzan (pil berkedip 30 detik di atas aplikasi apa pun) dan adzan
++ * (suara + panel "Waktu Dzuhur"; OK/Back menghentikan). Berjalan sebagai foreground service
++ * selama tampil, lalu berhenti sendiri. Screensaver diberi tahu lewat broadcast {@link #ACTION_SHOW}
++ * karena jendela screensaver berada di atas overlay.
++ */
++public class AdzanService extends Service {
++
++    static final String ACTION_SHOW = "com.gathin.tvhome.ADZAN_SHOW";
++    private static final String CHANNEL = "adzan";
++
++    private WindowManager wm;
++    private View warnView, adzanView;
++    private MediaPlayer player;
++    private AudioManager audio;
++    private AudioFocusRequest focus;
++
++    @Override
++    public IBinder onBind(Intent intent) {
++        return null;
++    }
++
++    @Override
++    public void onCreate() {
++        super.onCreate();
++        wm = getSystemService(WindowManager.class);
++        audio = getSystemService(AudioManager.class);
++        NotificationManager nm = getSystemService(NotificationManager.class);
++        nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Adzan", NotificationManager.IMPORTANCE_LOW));
++    }
++
++    @Override
++    public int onStartCommand(Intent intent, int flags, int startId) {
++        Notification n = new Notification.Builder(this, CHANNEL)
++                .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
++                .setContentTitle("Jadwal sholat")
++                .build();
++        startForeground(7, n);
++        if (intent == null) {
++            finish();
++            return START_NOT_STICKY;
++        }
++        String kind = intent.getStringExtra(AdzanScheduler.EXTRA_KIND);
++        int p = intent.getIntExtra(AdzanScheduler.EXTRA_PRAYER, 1);
++        String name = PrayerTimes.NAMES[p];
++        String time = PrayerTimes.hhmm(intent.getIntExtra(AdzanScheduler.EXTRA_MINUTE, 0));
++        Log.i(AdzanScheduler.TAG, "fire " + kind + " " + name + " " + time);
++        sendBroadcast(new Intent(ACTION_SHOW).setPackage(getPackageName())
++                .putExtra(AdzanScheduler.EXTRA_KIND, kind)
++                .putExtra("name", name).putExtra("time", time));
++        if ("adzan".equals(kind)) startAdzan(name, time);
++        else showWarning(name, time);
++        return START_NOT_STICKY;
++    }
++
++    private int screenH() {
++        DisplayMetrics dm = new DisplayMetrics();
++        wm.getDefaultDisplay().getRealMetrics(dm);
++        return Math.min(dm.widthPixels, dm.heightPixels);
++    }
++
++    private boolean canOverlay() {
++        return Settings.canDrawOverlays(this);
++    }
++
++    /** Nada pengumuman ala stasiun + "waktu sholat tiba"; video yang berjalan dikecilkan sebentar. */
++    private void playAnnouncement() {
++        AudioAttributes attrs = new AudioAttributes.Builder()
++                .setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
++                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
++                .build();
++        AudioFocusRequest duck = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
++                .setAudioAttributes(attrs)
++                .setOnAudioFocusChangeListener(change -> { })
++                .build();
++        audio.requestAudioFocus(duck);
++        try {
++            MediaPlayer mp = MediaPlayer.create(this, R.raw.pengumuman,
++                    new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
++                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build(),
++                    audio.generateAudioSessionId());
++            mp.setOnCompletionListener(p -> {
++                p.release();
++                audio.abandonAudioFocusRequest(duck);
++            });
++            mp.start();
++        } catch (RuntimeException e) {
++            Log.e(AdzanScheduler.TAG, "gagal memutar pengumuman", e);
++            audio.abandonAudioFocusRequest(duck);
++        }
++    }
++
++    private void showWarning(String name, String time) {
++        removeWarning();
++        playAnnouncement();
++        if (!canOverlay()) {
++            Log.w(AdzanScheduler.TAG, "izin overlay belum ada");
++            finishIfIdle();
++            return;
++        }
++        int h = screenH();
++        TextView v = AdzanViews.warning(this, name, time, h);
++        WindowManager.LayoutParams lp = overlayParams(false);
++        lp.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
++        lp.y = Math.round(h * 0.06f);
++        wm.addView(v, lp);
++        warnView = v;
++        AdzanViews.blink(v, () -> {
++            removeWarning();
++            finishIfIdle();
++        });
++    }
++
++    private void startAdzan(String name, String time) {
++        removeWarning();
++        if (canOverlay()) {
++            int h = screenH();
++            FrameLayout root = new FrameLayout(this) {
++                @Override
++                public boolean dispatchKeyEvent(KeyEvent e) {
++                    int k = e.getKeyCode();
++                    if (e.getAction() == KeyEvent.ACTION_UP && (k == KeyEvent.KEYCODE_BACK
++                            || k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER
++                            || k == KeyEvent.KEYCODE_HOME)) {
++                        stopAdzan();
++                    }
++                    // Tombol volume tetap ke sistem; tombol lain ditahan selama adzan.
++                    return !(k == KeyEvent.KEYCODE_VOLUME_UP || k == KeyEvent.KEYCODE_VOLUME_DOWN
++                            || k == KeyEvent.KEYCODE_VOLUME_MUTE);
++                }
++            };
++            TextView panel = AdzanViews.adzan(this, name, time, h);
++            root.addView(panel, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT,
++                    FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
++            WindowManager.LayoutParams lp = overlayParams(true);
++            lp.width = WindowManager.LayoutParams.MATCH_PARENT;
++            lp.height = WindowManager.LayoutParams.MATCH_PARENT;
++            wm.addView(root, lp);
++            root.requestFocus();
++            adzanView = root;
++        }
++        AudioAttributes attrs = new AudioAttributes.Builder()
++                .setUsage(AudioAttributes.USAGE_MEDIA)
++                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
++                .build();
++        focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
++                .setAudioAttributes(attrs)
++                .setOnAudioFocusChangeListener(change -> { })
++                .build();
++        audio.requestAudioFocus(focus);
++        try {
++            // res/raw/adzan.mp3 disediakan sendiri oleh pengguna (lihat README); tanpa file itu hanya panel yang tampil.
++            int res = getResources().getIdentifier("adzan", "raw", getPackageName());
++            if (res == 0) {
++                Log.w(AdzanScheduler.TAG, "res/raw/adzan.mp3 tidak ada, adzan tanpa suara");
++                return;
++            }
++            player = MediaPlayer.create(this, res, attrs, audio.generateAudioSessionId());
++            player.setOnCompletionListener(mp -> stopAdzan());
++            player.start();
++        } catch (RuntimeException e) {
++            Log.e(AdzanScheduler.TAG, "gagal memutar adzan", e);
++            stopAdzan();
++        }
++    }
++
++    private WindowManager.LayoutParams overlayParams(boolean focusable) {
++        int flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
++                | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON;
++        if (!focusable) {
++            flags |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
++                    | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
++        }
++        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
++                WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
++                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT);
++        if (focusable) lp.dimAmount = 0.55f;
++        if (focusable) lp.flags |= WindowManager.LayoutParams.FLAG_DIM_BEHIND;
++        return lp;
++    }
++
++    private void stopAdzan() {
++        if (player != null) {
++            try {
++                player.stop();
++            } catch (RuntimeException ignored) {
++            }
++            player.release();
++            player = null;
++        }
++        if (focus != null) {
++            audio.abandonAudioFocusRequest(focus);
++            focus = null;
++        }
++        if (adzanView != null) {
++            wm.removeView(adzanView);
++            adzanView = null;
++        }
++        finishIfIdle();
++    }
++
++    private void removeWarning() {
++        if (warnView != null) {
++            warnView.animate().cancel();
++            try {
++                wm.removeView(warnView);
++            } catch (RuntimeException ignored) {
++            }
++            warnView = null;
++        }
++    }
++
++    private void finishIfIdle() {
++        if (warnView == null && adzanView == null && player == null) finish();
++    }
++
++    private void finish() {
++        stopForeground(true);
++        stopSelf();
++    }
++
++    @Override
++    public void onDestroy() {
++        removeWarning();
++        if (player != null || adzanView != null) stopAdzan();
++        super.onDestroy();
++    }
++
++    /** Untuk pratinjau tanpa tampil di TV: gambar peringatan ke PNG berukuran layar. */
++    static java.io.File renderWarningPng(Context c, String name, String time) throws java.io.IOException {
++        DisplayMetrics dm = new DisplayMetrics();
++        c.getSystemService(WindowManager.class).getDefaultDisplay().getRealMetrics(dm);
++        int w = dm.widthPixels, h = dm.heightPixels;
++        TextView v = AdzanViews.warning(c, name, time, Math.min(w, h));
++        v.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.AT_MOST),
++                View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.AT_MOST));
++        v.layout(0, 0, v.getMeasuredWidth(), v.getMeasuredHeight());
++        android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888);
++        android.graphics.Canvas canvas = new android.graphics.Canvas(bmp);
++        canvas.translate((w - v.getMeasuredWidth()) / 2f, Math.round(Math.min(w, h) * 0.06f));
++        v.draw(canvas);
++        java.io.File out = new java.io.File(c.getExternalFilesDir(null), "preview-warning.png");
++        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
++            bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos);
++        }
++        return out;
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/AdzanSystemReceiver.java b/launcher/app/src/main/java/com/gathin/tvhome/AdzanSystemReceiver.java
+new file mode 100644
+index 0000000..b1a3972
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/AdzanSystemReceiver.java
+@@ -0,0 +1,37 @@
++package com.gathin.tvhome;
++
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++import android.util.Log;
++
++/**
++ * Kejadian sistem yang membuat jadwal adzan perlu dihitung ulang (TV menyala, jam/zona waktu
++ * diubah, aplikasi diperbarui). Juga {@code com.gathin.tvhome.ADZAN_PREVIEW} dari adb untuk
++ * menggambar peringatan ke PNG tanpa menampilkannya di TV.
++ */
++public class AdzanSystemReceiver extends BroadcastReceiver {
++
++    static final String ACTION_PREVIEW = "com.gathin.tvhome.ADZAN_PREVIEW";
++
++    @Override
++    public void onReceive(Context context, Intent intent) {
++        if (ACTION_PREVIEW.equals(intent.getAction())) {
++            try {
++                Config cfg = Config.load(context);
++                java.util.Calendar now = java.util.Calendar.getInstance();
++                int[] t = PrayerTimes.forDay(now, cfg.prayerLat, cfg.prayerLng, cfg.prayerIhtiyat);
++                // Waktu sholat berikutnya (Dzuhur-Isya), agar pratinjau cocok dengan layar saat itu.
++                int cur = now.get(java.util.Calendar.HOUR_OF_DAY) * 60 + now.get(java.util.Calendar.MINUTE);
++                int p = 1;
++                for (int i = 1; i <= 4; i++) if (t[i] > cur) { p = i; break; }
++                Log.i(AdzanScheduler.TAG, "preview " + AdzanService.renderWarningPng(context,
++                        PrayerTimes.NAMES[p], PrayerTimes.hhmm(t[p])));
++            } catch (Exception e) {
++                Log.e(AdzanScheduler.TAG, "preview gagal", e);
++            }
++            return;
++        }
++        AdzanScheduler.scheduleNext(context);
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/AdzanViews.java b/launcher/app/src/main/java/com/gathin/tvhome/AdzanViews.java
+new file mode 100644
+index 0000000..7f0c29b
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/AdzanViews.java
+@@ -0,0 +1,99 @@
++package com.gathin.tvhome;
++
++import android.animation.ObjectAnimator;
++import android.animation.ValueAnimator;
++import android.content.Context;
++import android.graphics.Typeface;
++import android.graphics.drawable.GradientDrawable;
++import android.text.SpannableStringBuilder;
++import android.text.style.ForegroundColorSpan;
++import android.text.style.RelativeSizeSpan;
++import android.util.TypedValue;
++import android.view.Gravity;
++import android.view.View;
++import android.widget.TextView;
++
++/** Tampilan peringatan dan adzan, dipakai overlay {@link AdzanService} dan screensaver. */
++final class AdzanViews {
++
++    static final long BLINK_TOTAL_MS = 30_000L;
++    private static final int GOLD = 0xFFF2CD7A;
++
++    private AdzanViews() {}
++
++    private static Typeface font(Context c) {
++        try {
++            return c.getResources().getFont(R.font.outfit);
++        } catch (RuntimeException e) {
++            return Typeface.DEFAULT_BOLD;
++        }
++    }
++
++    /** Pil berkedip "⚠ 5 menit lagi Dzuhur · 11:16"; {@code screenH} = tinggi layar dalam px. */
++    static TextView warning(Context c, String prayer, String time, int screenH) {
++        TextView v = new TextView(c);
++        SpannableStringBuilder sb = new SpannableStringBuilder();
++        sb.append("5 menit lagi ");
++        int s = sb.length();
++        sb.append(prayer);
++        sb.setSpan(new ForegroundColorSpan(GOLD), s, sb.length(), 0);
++        s = sb.length();
++        sb.append("  ·  ").append(time);
++        sb.setSpan(new RelativeSizeSpan(0.85f), s, sb.length(), 0);
++        v.setText(sb);
++        style(c, v, screenH * 0.062f, screenH);
++        return v;
++    }
++
++    /** Panel besar saat adzan: "Waktu Dzuhur" dan petunjuk menghentikan. */
++    static TextView adzan(Context c, String prayer, String time, int screenH) {
++        TextView v = new TextView(c);
++        SpannableStringBuilder sb = new SpannableStringBuilder();
++        sb.append("Waktu ");
++        int s = sb.length();
++        sb.append(prayer);
++        sb.setSpan(new ForegroundColorSpan(GOLD), s, sb.length(), 0);
++        sb.append("  ").append(time).append("\n");
++        s = sb.length();
++        sb.append("Tekan OK atau Back untuk menghentikan adzan");
++        sb.setSpan(new RelativeSizeSpan(0.42f), s, sb.length(), 0);
++        sb.setSpan(new ForegroundColorSpan(0xFFC9CACD), s, sb.length(), 0);
++        v.setText(sb);
++        v.setLineSpacing(0f, 1.25f);
++        style(c, v, screenH * 0.09f, screenH);
++        return v;
++    }
++
++    private static void style(Context c, TextView v, float textPx, int screenH) {
++        v.setTypeface(font(c));
++        v.setFontVariationSettings("'wght' 600");
++        v.setTextColor(0xFFFFFFFF);
++        v.setTextSize(TypedValue.COMPLEX_UNIT_PX, textPx);
++        v.setGravity(Gravity.CENTER);
++        v.setIncludeFontPadding(false);
++        int padH = Math.round(screenH * 0.055f), padV = Math.round(screenH * 0.03f);
++        v.setPadding(padH, padV, padH, padV);
++        GradientDrawable bg = new GradientDrawable();
++        bg.setColor(0xFF151517);
++        bg.setCornerRadius(screenH * 0.045f);
++        bg.setStroke(Math.max(3, Math.round(screenH * 0.005f)), GOLD);
++        v.setBackground(bg);
++        v.setElevation(screenH * 0.02f);
++    }
++
++    /** Berkedip selama 30 detik, lalu menjalankan {@code end}. */
++    static ObjectAnimator blink(View v, Runnable end) {
++        ObjectAnimator a = ObjectAnimator.ofFloat(v, View.ALPHA, 1f, 0.12f);
++        a.setDuration(500);
++        a.setRepeatMode(ValueAnimator.REVERSE);
++        a.setRepeatCount((int) (BLINK_TOTAL_MS / 500) - 1);
++        a.addListener(new android.animation.AnimatorListenerAdapter() {
++            @Override
++            public void onAnimationEnd(android.animation.Animator animation) {
++                if (end != null) end.run();
++            }
++        });
++        a.start();
++        return a;
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/Backdrop.java b/launcher/app/src/main/java/com/gathin/tvhome/Backdrop.java
+index 31d8dbc..de51b68 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/Backdrop.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/Backdrop.java
+@@ -32,7 +32,8 @@ final class Backdrop {
+      * The blurred copy is this many times smaller than the screen in each direction. Shrinking is
+      * itself a blur, so this sets a floor on the softness: an eighth was too soft to tune down.
+      */
+-    static final int SCALE = 2;
++    // Mi Box 3 (Amlogic S905X, Mali-450): a third instead of a half, about 2.25x less blur work and memory.
++    static final int SCALE = 3;
+     /** Box radius and passes at the small size: about 4px of softening on screen. */
+     private static final int RADIUS = 2;
+     private static final int PASSES = 2;
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/ClockDream.java b/launcher/app/src/main/java/com/gathin/tvhome/ClockDream.java
+index 9f8ded9..226fc43 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/ClockDream.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/ClockDream.java
+@@ -1,146 +1,440 @@
+ package com.gathin.tvhome;
+ 
+-import android.graphics.Paint;
+-import android.graphics.Rect;
++import android.content.BroadcastReceiver;
++import android.content.Context;
++import android.content.Intent;
++import android.content.IntentFilter;
++import android.graphics.Typeface;
+ import android.os.Handler;
+ import android.os.Looper;
+ import android.service.dreams.DreamService;
+-import android.text.format.DateFormat;
+ import android.util.TypedValue;
++import android.view.Gravity;
+ import android.view.View;
+ import android.view.ViewGroup;
++import android.widget.FrameLayout;
+ import android.widget.LinearLayout;
+-import android.widget.TextClock;
+ import android.widget.TextView;
+ 
++import java.util.Calendar;
+ import java.util.Locale;
+ import java.util.Random;
+ 
+ /**
+- * Screensaver: a grey analog clock (see {@link ClockFace}) with the time and a short date beneath.
+- * It sits in the middle of the screen and every minute shifts a few pixels around the centre, so
+- * nothing burns in while it still reads as centred. No network, no images: cheap enough for a 1 GB TV.
++ * Screensaver jadwal sholat: kota dan penanggalan (hari + pasaran, Hijriyah) di atas, jam flip
++ * HH:MM:SS, hitung mundur ke waktu sholat berikutnya dalam bingkai emas, lalu lima kartu waktu sholat
++ * dengan waktu berikutnya disorot. Latar biru malam dengan siluet masjid digambar sebagai vektor.
+  *
+- * <p>Everything is sized from the screen's height, in the units the design was drawn in: a screen
+- * 380 units tall.
++ * <p>Semua ukuran dihitung dari tinggi layar (desain untuk 1080 px). Tiap menit isi layar bergeser
++ * beberapa piksel agar tidak burn-in. Tanpa jaringan dan tanpa file gambar.
+  */
+ public class ClockDream extends DreamService {
+ 
+     private static final long MOVE_MS = 60_000L;
+-    private static final float SCREEN_UNITS = 380f;
+ 
+     private final Handler handler = new Handler(Looper.getMainLooper());
+     private final Random random = new Random();
+-    private View content;
+-    private ClockFace face;
+ 
+-    private final Runnable tick = new Runnable() {
++    private FrameLayout root;
++    private LinearLayout content;
++    private FlipClockView flip;
++    private TextView headCity, headDate, headHijri, headZone, dateLine;
++    private TextView boxTitle, boxCount, boxSub;
++    private final LinearLayout[] cards = new LinearLayout[5];
++    private final TextView[] cardName = new TextView[5];
++    private final TextView[] cardTime = new TextView[5];
++    private final View[] cardBar = new View[5];
++    private TextView footer;
++    private Config cfg;
++    private Typeface font;
++    private float u = 1f;
++    private int activeCard = -2;
++    private long targetMs;
++    private View adzanBanner;
++
++    private final Runnable everySecond = new Runnable() {
++        @Override
++        public void run() {
++            updateCountdown();
++            handler.postDelayed(this, 1000L - (System.currentTimeMillis() % 1000L));
++        }
++    };
++
++    private final Runnable everyMinute = new Runnable() {
+         @Override
+         public void run() {
+-            moveClock();
++            updateDay();
++            nudge();
+             handler.postDelayed(this, MOVE_MS);
+         }
+     };
+ 
++    /** Peringatan/adzan dari AdzanService: jendela screensaver menutupi overlay, jadi tampilkan di sini. */
++    private final BroadcastReceiver adzanReceiver = new BroadcastReceiver() {
++        @Override
++        public void onReceive(Context c, Intent i) {
++            showAdzanBanner("adzan".equals(i.getStringExtra(AdzanScheduler.EXTRA_KIND)),
++                    i.getStringExtra("name"), i.getStringExtra("time"));
++        }
++    };
++
+     @Override
+     public void onAttachedToWindow() {
+         super.onAttachedToWindow();
+-        setInteractive(false);   // any key wakes the TV back to where it was
++        setInteractive(false);   // tombol apa pun membangunkan TV kembali
+         setFullscreen(true);
+-        setScreenBright(false);
++        setScreenBright(true);
+         setContentView(R.layout.dream_clock);
+-
+-        content = findViewById(R.id.dreamContent);
+-        face = new ClockFace(this);
+-        ((ViewGroup) content).addView(face, 0, new LinearLayout.LayoutParams(
+-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+-        TextClock date = findViewById(R.id.dreamDate);
+-        // The month in short and the year (in capitals, see dream_clock.xml): OCT 21, 2026.
+-        String pattern = DateFormat.getBestDateTimePattern(Locale.getDefault(), "MMMdyyyy");
+-        date.setFormat12Hour(pattern);
+-        date.setFormat24Hour(pattern);
+-        View screen = (View) content.getParent();
+-        screen.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+-            if (b - t != ob - ot) size(b - t);
+-        });
+-        // Re-centre once the clock has its size for this screen.
+-        content.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+-            if (r - l != or - ol || b - t != ob - ot) placeClock();
++        root = findViewById(R.id.dreamRoot);
++        cfg = Config.load(this);
++        try {
++            font = getResources().getFont(R.font.outfit);
++        } catch (RuntimeException e) {
++            font = Typeface.DEFAULT;
++        }
++        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
++            if (b - t != ob - ot || r - l != or - ol) build(r - l, b - t);
+         });
++        registerReceiver(adzanReceiver, new IntentFilter(AdzanService.ACTION_SHOW));
++        AdzanScheduler.scheduleNext(this);
++    }
++
++    // ---- tata letak ------------------------------------------------------------------------
++
++    private int px(float design) {
++        return Math.round(design * u);
+     }
+ 
+-    /** Lays the clock out for a screen {@code height} pixels tall. */
+-    private void size(int height) {
+-        float u = height / SCREEN_UNITS;
+-        face.setRimRadius(83.6f * u);
+-        TextView time = findViewById(R.id.dreamTime);
+-        TextView amPm = findViewById(R.id.dreamAmPm);
+-        TextView date = findViewById(R.id.dreamDate);
+-        time.setTextSize(TypedValue.COMPLEX_UNIT_PX, 44f * u);
+-        amPm.setTextSize(TypedValue.COMPLEX_UNIT_PX, 14f * u);
+-        date.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f);
+-
+-        // The tops of the digits sit 34 units under the rim, below the room the dial keeps for its shadow.
+-        LinearLayout.LayoutParams row = (LinearLayout.LayoutParams) findViewById(R.id.dreamTimeRow).getLayoutParams();
+-        row.topMargin = Math.round(34f * u - face.shadowRoom() - capInset(time, "0"));
+-        // AM/PM's capitals start where the digits do.
+-        LinearLayout.LayoutParams ampm = (LinearLayout.LayoutParams) amPm.getLayoutParams();
+-        ampm.leftMargin = Math.round(5f * u);
+-        amPm.setTranslationY(capInset(time, "0") - capInset(amPm, "PM"));
+-        // The date's capitals start 16.5 units under the digits' baseline.
+-        LinearLayout.LayoutParams dateRow = (LinearLayout.LayoutParams) date.getLayoutParams();
+-        dateRow.topMargin = Math.round(16.5f * u - time.getPaint().getFontMetrics().descent - capInset(date, "O"));
++    private TextView text(float size, int color, int weight, float spacing) {
++        TextView t = new TextView(this);
++        t.setTypeface(font);
++        t.setFontVariationSettings("'wght' " + weight);
++        t.setTextSize(TypedValue.COMPLEX_UNIT_PX, size * u);
++        t.setTextColor(color);
++        t.setLetterSpacing(spacing);
++        t.setIncludeFontPadding(false);
++        t.setMaxLines(1);
++        t.setGravity(Gravity.CENTER_HORIZONTAL);
++        return t;
++    }
++
++    private LinearLayout.LayoutParams wrap(int top) {
++        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++        lp.topMargin = px(top);
++        lp.gravity = Gravity.CENTER_HORIZONTAL;
++        return lp;
++    }
++
++    /** [garis] teks [garis], dengan garis memudar. */
++    private LinearLayout lined(TextView t, int lineW, int lineColor, int gap) {
++        LinearLayout row = new LinearLayout(this);
++        row.setOrientation(LinearLayout.HORIZONTAL);
++        row.setGravity(Gravity.CENTER_VERTICAL);
++        for (int i = 0; i < 2; i++) {
++            View line = new DreamArt.FadeLine(this, lineColor);
++            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(px(lineW), Math.max(1, px(2)));
++            if (i == 0) lp.rightMargin = px(gap);
++            else lp.leftMargin = px(gap);
++            if (i == 1) row.addView(t);
++            row.addView(line, lp);
++        }
++        return row;
++    }
++
++    private void build(int w, int h) {
++        u = h / 1080f;
++        root.removeAllViews();
++        root.addView(new DreamArt.Background(this), new FrameLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
++
++        content = new LinearLayout(this);
++        content.setOrientation(LinearLayout.VERTICAL);
++        content.setGravity(Gravity.CENTER_HORIZONTAL);
++        root.addView(content, new FrameLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
++
++        // Kepala: lokasi + hari pasaran | Hijriyah + zona waktu.
++        LinearLayout head = new LinearLayout(this);
++        head.setOrientation(LinearLayout.HORIZONTAL);
++        head.setGravity(Gravity.CENTER_VERTICAL);
++        View pin = new DreamArt.Icon(this, DreamArt.Icon.PIN);
++        head.addView(pin, new LinearLayout.LayoutParams(px(32), px(42)));
++        LinearLayout leftTexts = new LinearLayout(this);
++        leftTexts.setOrientation(LinearLayout.VERTICAL);
++        headCity = text(28, DreamArt.GOLD, 650, 0.06f);
++        headDate = text(25, 0xFFD3D6DD, 500, 0.03f);
++        leftTexts.addView(headCity);
++        LinearLayout.LayoutParams sub = new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++        sub.topMargin = px(10);
++        leftTexts.addView(headDate, sub);
++        // Lebar tetap: tulisan kepala diganti tiap menit dan tidak boleh terpotong.
++        LinearLayout.LayoutParams lt = new LinearLayout.LayoutParams(px(520), ViewGroup.LayoutParams.WRAP_CONTENT);
++        lt.leftMargin = px(24);
++        head.addView(leftTexts, lt);
++        View divider = new View(this);
++        divider.setBackgroundColor(0x55FFFFFF);
++        LinearLayout.LayoutParams dv = new LinearLayout.LayoutParams(Math.max(1, px(2)), px(66));
++        dv.leftMargin = px(20);
++        dv.rightMargin = px(70);
++        head.addView(divider, dv);
++        head.addView(new DreamArt.Icon(this, DreamArt.Icon.MOON), new LinearLayout.LayoutParams(px(56), px(56)));
++        LinearLayout rightTexts = new LinearLayout(this);
++        rightTexts.setOrientation(LinearLayout.VERTICAL);
++        headHijri = text(28, DreamArt.GOLD, 650, 0.03f);
++        headZone = text(25, 0xFFD3D6DD, 450, 0.02f);
++        for (TextView t : new TextView[]{headCity, headDate, headHijri, headZone}) t.setGravity(Gravity.START);
++        rightTexts.addView(headHijri);
++        LinearLayout.LayoutParams sub2 = new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++        sub2.topMargin = px(10);
++        rightTexts.addView(headZone, sub2);
++        LinearLayout.LayoutParams rt = new LinearLayout.LayoutParams(px(460), ViewGroup.LayoutParams.WRAP_CONTENT);
++        rt.leftMargin = px(22);
++        head.addView(rightTexts, rt);
++        content.addView(head, wrap(34));
++
++        View gold = new DreamArt.FadeLine(this, 0xCCE9B85C);
++        LinearLayout.LayoutParams gl = new LinearLayout.LayoutParams(Math.round(w * 0.92f), Math.max(2, px(3)));
++        gl.topMargin = px(24);
++        gl.gravity = Gravity.CENTER_HORIZONTAL;
++        content.addView(gold, gl);
++
++        // Jam flip.
++        flip = new FlipClockView(this);
++        flip.setDigitWidth(h * 0.162f);
++        content.addView(flip, wrap(38));
++
++        // Hari dan tanggal dengan garis di kiri-kanan.
++        dateLine = text(30, 0xFFC9CCD4, 550, 0.34f);
++        content.addView(lined(dateLine, 300, 0x40FFFFFF, 42), wrap(40));
++
++        // Kotak hitung mundur.
++        LinearLayout box = new LinearLayout(this);
++        box.setOrientation(LinearLayout.VERTICAL);
++        box.setGravity(Gravity.CENTER_HORIZONTAL);
++        android.graphics.drawable.GradientDrawable boxBg = new android.graphics.drawable.GradientDrawable(
++                android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
++                new int[]{0xE01E1A13, 0xE0141210});
++        boxBg.setCornerRadius(px(26));
++        boxBg.setStroke(Math.max(2, px(2.5f)), DreamArt.GOLD);
++        box.setBackground(boxBg);
++        box.setPadding(px(40), px(18), px(40), px(16));
++        boxTitle = text(30, DreamArt.GOLD, 600, 0.22f);
++        box.addView(lined(boxTitle, 200, 0x99E9B85C, 30));
++        boxCount = text(86, DreamArt.GOLD, 600, 0.06f);
++        LinearLayout.LayoutParams bc = new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++        bc.topMargin = px(8);
++        box.addView(boxCount, bc);
++        boxSub = text(27, 0xFFB9BCC4, 500, 0.06f);
++        LinearLayout.LayoutParams bs = new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++        bs.topMargin = px(8);
++        box.addView(boxSub, bs);
++        LinearLayout.LayoutParams boxLp = new LinearLayout.LayoutParams(px(990), ViewGroup.LayoutParams.WRAP_CONTENT);
++        boxLp.topMargin = px(36);
++        boxLp.gravity = Gravity.CENTER_HORIZONTAL;
++        content.addView(box, boxLp);
++
++        // Lima kartu waktu sholat.
++        LinearLayout row = new LinearLayout(this);
++        row.setOrientation(LinearLayout.HORIZONTAL);
++        for (int i = 0; i < 5; i++) {
++            FrameLayout holder = new FrameLayout(this);
++            LinearLayout card = new LinearLayout(this);
++            card.setOrientation(LinearLayout.VERTICAL);
++            card.setGravity(Gravity.CENTER);
++            cardName[i] = text(30, 0xFFC4C7CF, 600, 0.06f);
++            cardTime[i] = text(56, 0xFFFFFFFF, 550, 0.02f);
++            card.addView(cardName[i]);
++            LinearLayout.LayoutParams ct = new LinearLayout.LayoutParams(
++                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++            ct.topMargin = px(12);
++            card.addView(cardTime[i], ct);
++            holder.addView(card, new FrameLayout.LayoutParams(px(300), px(160)));
++            View bar = new View(this);
++            android.graphics.drawable.GradientDrawable barBg = new android.graphics.drawable.GradientDrawable();
++            barBg.setColor(DreamArt.GOLD);
++            barBg.setCornerRadius(px(4));
++            bar.setBackground(barBg);
++            FrameLayout.LayoutParams bl = new FrameLayout.LayoutParams(px(92), px(8),
++                    Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
++            bl.bottomMargin = px(2);
++            holder.addView(bar, bl);
++            cards[i] = card;
++            cardBar[i] = bar;
++            LinearLayout.LayoutParams hl = new LinearLayout.LayoutParams(px(300), px(160));
++            if (i > 0) hl.leftMargin = px(18);
++            row.addView(holder, hl);
++        }
++        content.addView(row, wrap(36));
++
++        footer = text(28, 0xFF9A9DA6, 450, 0.05f);
++        content.addView(lined(footer, 380, 0x99E9B85C, 40), wrap(40));
++
++        activeCard = -2;
++        updateDay();
++        updateCountdown();
++        content.setAlpha(0f);
++        content.animate().alpha(1f).setDuration(1200).start();
++        if (isDreamingStarted) flip.start();
++    }
++
++    // ---- isi -------------------------------------------------------------------------------
++
++    private void updateDay() {
++        if (headCity == null) return;
++        Calendar now = Calendar.getInstance();
++        String city = cfg.prayerCity.isEmpty() ? "" : cfg.prayerCity.toUpperCase(Locale.ROOT) + "  ·  ";
++        headCity.setText(city + "INDONESIA");
++        headDate.setText((Penanggalan.hari(now) + " " + Penanggalan.pasaran(now) + "  ·  "
++                + Penanggalan.tanggal(now)).toUpperCase(Locale.ROOT));
++        String hijri = Penanggalan.hijriyah(now, getResources().getInteger(R.integer.hijri_offset_days));
++        headHijri.setText(hijri);
++        headZone.setText(Penanggalan.zona(now));
++        dateLine.setText((Penanggalan.hari(now) + "  ·  " + Penanggalan.tanggal(now)).toUpperCase(Locale.ROOT));
++        footer.setText("Jadwal Salat  ·  Kota " + (cfg.prayerCity.isEmpty() ? "" : cfg.prayerCity));
++        int[] t = PrayerTimes.forDay(now, cfg.prayerLat, cfg.prayerLng, cfg.prayerIhtiyat);
++        for (int i = 0; i < 5; i++) {
++            cardName[i].setText(PrayerTimes.NAMES[i].toUpperCase(Locale.ROOT));
++            cardTime[i].setText(PrayerTimes.hhmm(t[i]));
++        }
+         content.requestLayout();
+     }
+ 
+-    /** How far below the top of {@code view} the tops of {@code letters} are drawn. */
++    /** Sasaran hitung mundur: waktu sholat berikutnya hari ini, atau Subuh besok. */
++    private void updateCountdown() {
++        if (boxCount == null) return;
++        long nowMs = System.currentTimeMillis();
++        Calendar now = Calendar.getInstance();
++        int[] t = PrayerTimes.forDay(now, cfg.prayerLat, cfg.prayerLng, cfg.prayerIhtiyat);
++        int next = -1;
++        long at = 0;
++        for (int i = 0; i < 5; i++) {
++            at = atMinute(now, 0, t[i]);
++            if (at > nowMs) {
++                next = i;
++                break;
++            }
++        }
++        int minute;
++        if (next < 0) {
++            Calendar tomorrow = (Calendar) now.clone();
++            tomorrow.add(Calendar.DAY_OF_MONTH, 1);
++            minute = PrayerTimes.forDay(tomorrow, cfg.prayerLat, cfg.prayerLng, cfg.prayerIhtiyat)[0];
++            at = atMinute(now, 1, minute);
++            next = 0;
++        } else {
++            minute = t[next];
++        }
++        targetMs = at;
++        long s = Math.max(0, (targetMs - nowMs + 999) / 1000);
++        boxCount.setText(String.format(Locale.ROOT, "%02d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60));
++        String name = PrayerTimes.NAMES[next];
++        boxTitle.setText("MENUJU " + name.toUpperCase(Locale.ROOT));
++        boxSub.setText(name + "  ·  " + PrayerTimes.hhmm(minute) + " " + Penanggalan.zonaSingkat(now));
++        if (next != activeCard) setActive(next);
++    }
++
++    /** Seberapa jauh di bawah tepi atas {@code view} bagian atas {@code letters} digambar (dipakai MainActivity). */
+     static float capInset(TextView view, String letters) {
+-        Paint paint = view.getPaint();
+-        Rect bounds = new Rect();
++        android.graphics.Paint paint = view.getPaint();
++        android.graphics.Rect bounds = new android.graphics.Rect();
+         paint.getTextBounds(letters, 0, letters.length(), bounds);
+         return bounds.top - paint.getFontMetrics().ascent;
+     }
+ 
++    private static long atMinute(Calendar base, int dayOffset, int minute) {
++        Calendar c = (Calendar) base.clone();
++        c.add(Calendar.DAY_OF_MONTH, dayOffset);
++        c.set(Calendar.HOUR_OF_DAY, 0);
++        c.set(Calendar.MINUTE, 0);
++        c.set(Calendar.SECOND, 0);
++        c.set(Calendar.MILLISECOND, 0);
++        c.add(Calendar.MINUTE, minute);
++        return c.getTimeInMillis();
++    }
++
++    private void setActive(int index) {
++        activeCard = index;
++        for (int i = 0; i < 5; i++) {
++            boolean on = i == index;
++            cards[i].setBackground(DreamArt.card(px(18), on, u));
++            cardName[i].setTextColor(on ? DreamArt.GOLD : 0xFFC4C7CF);
++            cardBar[i].setVisibility(on ? View.VISIBLE : View.INVISIBLE);
++        }
++    }
++
++    /** Geser isi beberapa piksel tiap menit agar layar tidak burn-in. */
++    private void nudge() {
++        if (content == null) return;
++        content.animate().translationX(px(8) * (2f * random.nextFloat() - 1f))
++                .translationY(px(6) * (2f * random.nextFloat() - 1f)).setDuration(2000).start();
++    }
++
++    // ---- peringatan / adzan ----------------------------------------------------------------
++
++    private void showAdzanBanner(boolean adzan, String name, String time) {
++        if (root == null) return;
++        if (adzanBanner != null) root.removeView(adzanBanner);
++        int h = root.getHeight();
++        TextView v = adzan ? AdzanViews.adzan(this, name, time, h) : AdzanViews.warning(this, name, time, h);
++        if (adzan) {
++            // Di screensaver tanpa petunjuk tombol: tombol apa pun sudah membangunkan TV.
++            CharSequence t = v.getText();
++            v.setText(t.subSequence(0, t.toString().indexOf('\n')));
++        }
++        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
++                adzan ? Gravity.CENTER : Gravity.TOP | Gravity.CENTER_HORIZONTAL);
++        if (!adzan) lp.topMargin = Math.round(h * 0.03f);
++        root.addView(v, lp);
++        adzanBanner = v;
++        if (adzan) {
++            if (content != null) content.setAlpha(0.15f);
++            handler.postDelayed(() -> {
++                root.removeView(v);
++                if (adzanBanner == v) adzanBanner = null;
++                if (content != null) content.setAlpha(1f);
++            }, 4 * 60_000L);
++        } else {
++            AdzanViews.blink(v, () -> {
++                root.removeView(v);
++                if (adzanBanner == v) adzanBanner = null;
++            });
++        }
++    }
++
++    // ---- siklus hidup ----------------------------------------------------------------------
++
++    private boolean isDreamingStarted;
++
+     @Override
+     public void onDreamingStarted() {
+         super.onDreamingStarted();
+-        content.setAlpha(0f);
+-        content.post(() -> {
+-            placeClock();
+-            content.animate().alpha(1f).setDuration(1200).start();
+-        });
+-        face.start();
+-        handler.postDelayed(tick, MOVE_MS);
++        isDreamingStarted = true;
++        if (flip != null) flip.start();
++        handler.post(everySecond);
++        handler.postDelayed(everyMinute, MOVE_MS);
+     }
+ 
+     @Override
+     public void onDreamingStopped() {
+-        handler.removeCallbacks(tick);
+-        face.stop();
++        isDreamingStarted = false;
++        handler.removeCallbacksAndMessages(null);
++        if (flip != null) flip.stop();
+         super.onDreamingStopped();
+     }
+ 
+     @Override
+     public void onDetachedFromWindow() {
+-        handler.removeCallbacks(tick);
++        try {
++            unregisterReceiver(adzanReceiver);
++        } catch (IllegalArgumentException ignored) {
++        }
++        handler.removeCallbacksAndMessages(null);
+         super.onDetachedFromWindow();
+     }
+-
+-    private void moveClock() {
+-        content.animate().alpha(0f).setDuration(900).withEndAction(() -> {
+-            placeClock();
+-            content.animate().alpha(1f).setDuration(1200).start();
+-        }).start();
+-    }
+-
+-    /** The middle of the screen, nudged up to 1.5 % either way. */
+-    private void placeClock() {
+-        View parent = (View) content.getParent();
+-        float nudgeX = parent.getWidth() * 0.015f * (2f * random.nextFloat() - 1f);
+-        float nudgeY = parent.getHeight() * 0.015f * (2f * random.nextFloat() - 1f);
+-        float x = (parent.getWidth() - content.getWidth()) / 2f + nudgeX;
+-        float y = (parent.getHeight() - content.getHeight()) / 2f + nudgeY;
+-        content.setX(x);
+-        content.setY(y);
+-    }
+ }
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/Config.java b/launcher/app/src/main/java/com/gathin/tvhome/Config.java
+index c6e55a9..e21b455 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/Config.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/Config.java
+@@ -66,6 +66,12 @@ final class Config {
+     final int cacheCleanDays;
+     /** Whether the overlay file was present and parsed. */
+     final boolean overlayApplied;
++    /** Jadwal sholat di bar atas dan screensaver (prayer_times), lokasi kota, dan ihtiyat dalam menit. */
++    boolean prayerTimes;
++    String prayerCity;
++    double prayerLat;
++    double prayerLng;
++    int prayerIhtiyat;
+ 
+     private Config(List<String> dockApps, List<String> hiddenApps, String liveTvPackage, String liveTvAction,
+                    String sourcePanelService, String sourcePanelAction, String inputAction,
+@@ -171,10 +177,38 @@ final class Config {
+         int cacheCleanDays = json != null ? integer(json, "cache_clean_days", CacheCleaner.DEFAULT_DAYS, 0, 90)
+                 : CacheCleaner.DEFAULT_DAYS;
+ 
+-        return new Config(dock, hidden, liveTv, liveTvAction, panelService, panelAction, inputAction,
++        Config c = new Config(dock, hidden, liveTv, liveTvAction, panelService, panelAction, inputAction,
+                 Math.max(1, columns), Math.max(0, rowsBelow), shamsi, moduleCards, reducedMotion,
+                 vpn, homeSettings, networkPill, liveTvRow, background, wallpaper, wallpapers, wallpaperIntervalMs,
+                 places, cacheCleanDays, applied);
++        c.prayerTimes = res.getBoolean(R.bool.prayer_times);
++        c.prayerCity = res.getString(R.string.prayer_city).trim();
++        c.prayerLat = parseDouble(res.getString(R.string.prayer_lat), -7.9666);
++        c.prayerLng = parseDouble(res.getString(R.string.prayer_lng), 112.6326);
++        c.prayerIhtiyat = res.getInteger(R.integer.prayer_ihtiyat_minutes);
++        if (json != null) {
++            c.prayerTimes = bool(json, "prayer_times", c.prayerTimes);
++            c.prayerCity = string(json, "prayer_city", c.prayerCity);
++            c.prayerLat = decimal(json, "prayer_lat", c.prayerLat, -66, 66);
++            c.prayerLng = decimal(json, "prayer_lng", c.prayerLng, -180, 180);
++            c.prayerIhtiyat = integer(json, "prayer_ihtiyat_minutes", c.prayerIhtiyat, 0, 10);
++        }
++        return c;
++    }
++
++    private static double parseDouble(String s, double fallback) {
++        try {
++            return Double.parseDouble(s.trim());
++        } catch (NumberFormatException e) {
++            return fallback;
++        }
++    }
++
++    private static double decimal(JSONObject o, String key, double fallback, double min, double max) {
++        Object v = o.opt(key);
++        if (!(v instanceof Number)) return fallback;
++        double d = ((Number) v).doubleValue();
++        return d < min || d > max ? fallback : d;
+     }
+ 
+     /** Reads and parses the overlay; any problem means "no overlay", never a crash on the home screen. */
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/DreamArt.java b/launcher/app/src/main/java/com/gathin/tvhome/DreamArt.java
+new file mode 100644
+index 0000000..d825996
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/DreamArt.java
+@@ -0,0 +1,225 @@
++package com.gathin.tvhome;
++
++import android.content.Context;
++import android.graphics.Canvas;
++import android.graphics.LinearGradient;
++import android.graphics.Paint;
++import android.graphics.Path;
++import android.graphics.RadialGradient;
++import android.graphics.Shader;
++import android.view.View;
++
++/** Gambar vektor untuk screensaver jadwal sholat: latar, garis emas, dan ikon. Tanpa file gambar. */
++final class DreamArt {
++
++    static final int GOLD = 0xFFE9B85C;
++    static final int GOLD_SOFT = 0xFFD9A955;
++
++    private DreamArt() {}
++
++    /** Latar biru malam dengan pola geometris samar di sisi, cahaya senja, dan siluet masjid. */
++    static final class Background extends View {
++        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final Path path = new Path();
++
++        Background(Context c) {
++            super(c);
++        }
++
++        @Override
++        protected void onDraw(Canvas canvas) {
++            int w = getWidth(), h = getHeight();
++            paint.setStyle(Paint.Style.FILL);
++            paint.setShader(new LinearGradient(0, 0, 0, h,
++                    new int[]{0xFF0A0F1C, 0xFF0C1324, 0xFF0A0E18, 0xFF06080D},
++                    new float[]{0f, 0.45f, 0.7f, 1f}, Shader.TileMode.CLAMP));
++            canvas.drawRect(0, 0, w, h, paint);
++
++            // Cahaya senja di kaki langit, kiri dan kanan.
++            for (float cx : new float[]{0.12f * w, 0.88f * w}) {
++                paint.setShader(new RadialGradient(cx, 0.66f * h, 0.30f * w,
++                        new int[]{0x66C87A2C, 0x22A0581E, 0x00000000}, new float[]{0f, 0.45f, 1f},
++                        Shader.TileMode.CLAMP));
++                canvas.drawRect(0, 0, w, h, paint);
++            }
++            paint.setShader(null);
++
++            drawPattern(canvas, w, h);
++
++            // Siluet masjid dan pepohonan.
++            paint.setColor(0xFF05070C);
++            float base = 0.76f * h, u = h / 1080f;
++            path.reset();
++            // kiri
++            minaret(path, 0.04f * w, base, 150 * u, 8 * u);
++            mosque(path, 0.075f * w, base, 48 * u);
++            minaret(path, 0.11f * w, base, 120 * u, 7 * u);
++            minaret(path, 0.13f * w, base, 135 * u, 7 * u);
++            mosque(path, 0.165f * w, base, 36 * u);
++            mosque(path, 0.20f * w, base, 28 * u);
++            // kanan
++            mosque(path, 0.79f * w, base, 30 * u);
++            minaret(path, 0.82f * w, base, 125 * u, 7 * u);
++            minaret(path, 0.838f * w, base, 145 * u, 7 * u);
++            mosque(path, 0.90f * w, base, 78 * u);
++            minaret(path, 0.965f * w, base, 110 * u, 7 * u);
++            canvas.drawPath(path, paint);
++            canvas.drawRect(0, base, 0.25f * w, h, paint);
++            canvas.drawRect(0.75f * w, base, w, h, paint);
++            // pepohonan di pojok bawah
++            paint.setColor(0xFF04060A);
++            for (int i = 0; i < 7; i++) {
++                canvas.drawCircle(0.01f * w + i * 22 * u, base + (20 + (i % 3) * 14) * u, (38 - i * 3) * u, paint);
++                canvas.drawCircle(w - 0.01f * w - i * 22 * u, base + (24 + (i % 2) * 16) * u, (36 - i * 3) * u, paint);
++            }
++            // tanah menyatu dengan latar bawah
++            paint.setShader(new LinearGradient(0, base - 40 * u, 0, h,
++                    new int[]{0x0006080D, 0xFF06080D}, null, Shader.TileMode.CLAMP));
++            canvas.drawRect(0, base - 40 * u, w, h, paint);
++            paint.setShader(null);
++        }
++
++        private static void mosque(Path p, float cx, float base, float r) {
++            float bodyH = r * 0.9f;
++            p.addRect(cx - r * 1.25f, base - bodyH, cx + r * 1.25f, base, Path.Direction.CW);
++            // kubah bawang
++            float top = base - bodyH;
++            p.moveTo(cx - r, top);
++            p.cubicTo(cx - r * 1.15f, top - r * 0.9f, cx - r * 0.25f, top - r * 1.15f, cx, top - r * 1.55f);
++            p.cubicTo(cx + r * 0.25f, top - r * 1.15f, cx + r * 1.15f, top - r * 0.9f, cx + r, top);
++            p.close();
++            p.addRect(cx - r * 0.03f, top - r * 1.85f, cx + r * 0.03f, top - r * 1.5f, Path.Direction.CW);
++        }
++
++        private static void minaret(Path p, float cx, float base, float height, float half) {
++            p.addRect(cx - half, base - height, cx + half, base, Path.Direction.CW);
++            p.addRect(cx - half * 1.6f, base - height * 0.72f, cx + half * 1.6f, base - height * 0.70f, Path.Direction.CW);
++            p.moveTo(cx - half * 1.2f, base - height);
++            p.lineTo(cx, base - height - half * 3.2f);
++            p.lineTo(cx + half * 1.2f, base - height);
++            p.close();
++        }
++
++        /** Bintang delapan samar di 14 % kiri dan kanan layar. */
++        private void drawPattern(Canvas canvas, int w, int h) {
++            Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
++            line.setStyle(Paint.Style.STROKE);
++            line.setStrokeWidth(Math.max(1f, h / 900f));
++            float s = h / 9f;
++            for (int side = 0; side < 2; side++) {
++                float x0 = side == 0 ? 0 : w - 0.14f * w;
++                for (float y = s / 2; y < 0.7f * h; y += s) {
++                    for (float x = x0 + s / 2; x < x0 + 0.14f * w + s; x += s) {
++                        float edge = side == 0 ? 1f - x / (0.14f * w) : (x - x0) / (0.14f * w);
++                        int a = (int) (22 * Math.max(0f, Math.min(1f, edge)) * (1f - y / (0.75f * h)));
++                        if (a <= 0) continue;
++                        line.setColor(a << 24 | 0x8899BB);
++                        star(canvas, x, y, s * 0.42f, line);
++                    }
++                }
++            }
++        }
++
++        private static void star(Canvas c, float cx, float cy, float r, Paint p) {
++            c.save();
++            c.translate(cx, cy);
++            c.drawRect(-r * 0.7f, -r * 0.7f, r * 0.7f, r * 0.7f, p);
++            c.rotate(45);
++            c.drawRect(-r * 0.7f, -r * 0.7f, r * 0.7f, r * 0.7f, p);
++            c.restore();
++        }
++    }
++
++    /** Garis tipis memudar di kedua ujung. */
++    static final class FadeLine extends View {
++        private final Paint paint = new Paint();
++        private final int color;
++
++        FadeLine(Context c, int color) {
++            super(c);
++            this.color = color;
++        }
++
++        @Override
++        protected void onDraw(Canvas canvas) {
++            int w = getWidth(), h = getHeight();
++            int clear = color & 0x00FFFFFF;
++            paint.setShader(new LinearGradient(0, 0, w, 0, new int[]{clear, color, color, clear},
++                    new float[]{0f, 0.3f, 0.7f, 1f}, Shader.TileMode.CLAMP));
++            canvas.drawRect(0, 0, w, h, paint);
++        }
++    }
++
++    /** Ikon lokasi (pin) atau bulan sabit dengan bintang, emas. */
++    static final class Icon extends View {
++        static final int PIN = 0, MOON = 1;
++        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final Path path = new Path();
++        private final int kind;
++
++        Icon(Context c, int kind) {
++            super(c);
++            this.kind = kind;
++            paint.setColor(GOLD);
++        }
++
++        @Override
++        protected void onDraw(Canvas canvas) {
++            float w = getWidth(), h = getHeight();
++            path.reset();
++            if (kind == PIN) {
++                float r = w * 0.36f, cx = w / 2f, cy = h * 0.38f;
++                path.addCircle(cx, cy, r, Path.Direction.CW);
++                path.moveTo(cx - r * 0.86f, cy + r * 0.5f);
++                path.lineTo(cx, h * 0.95f);
++                path.lineTo(cx + r * 0.86f, cy + r * 0.5f);
++                path.close();
++                canvas.drawPath(path, paint);
++                Paint hole = new Paint(Paint.ANTI_ALIAS_FLAG);
++                hole.setColor(0xFF0B1120);
++                canvas.drawCircle(cx, cy, r * 0.42f, hole);
++            } else {
++                float r = Math.min(w, h) * 0.46f, cx = w * 0.48f, cy = h / 2f;
++                path.addCircle(cx, cy, r, Path.Direction.CW);
++                Path cut = new Path();
++                cut.addCircle(cx + r * 0.42f, cy - r * 0.18f, r * 0.84f, Path.Direction.CW);
++                path.op(cut, Path.Op.DIFFERENCE);
++                canvas.drawPath(path, paint);
++                drawStar(canvas, cx + r * 0.38f, cy - r * 0.05f, r * 0.26f);
++            }
++        }
++
++        private void drawStar(Canvas c, float cx, float cy, float r) {
++            Path s = new Path();
++            for (int i = 0; i < 10; i++) {
++                double a = Math.PI / 2 + i * Math.PI / 5;
++                float rr = i % 2 == 0 ? r : r * 0.42f;
++                float x = cx + (float) (rr * Math.cos(a)), y = cy - (float) (rr * Math.sin(a));
++                if (i == 0) s.moveTo(x, y);
++                else s.lineTo(x, y);
++            }
++            s.close();
++            c.drawPath(s, paint);
++        }
++    }
++
++    /** Kartu sudut membulat; {@code active} memberi bingkai emas dengan cahaya lembut. */
++    static android.graphics.drawable.Drawable card(float radius, boolean active, float px) {
++        android.graphics.drawable.GradientDrawable inner = new android.graphics.drawable.GradientDrawable();
++        inner.setCornerRadius(radius);
++        inner.setColor(active ? 0xF0201B14 : 0xE014171F);
++        if (active) inner.setStroke(Math.max(2, Math.round(px * 2.5f)), GOLD);
++        else inner.setStroke(Math.max(1, Math.round(px)), 0x22FFFFFF);
++        if (!active) return inner;
++        android.graphics.drawable.GradientDrawable glow = new android.graphics.drawable.GradientDrawable();
++        glow.setCornerRadius(radius + px * 6);
++        glow.setColor(0x00000000);
++        glow.setStroke(Math.round(px * 6), 0x33E9B85C);
++        android.graphics.drawable.LayerDrawable ld = new android.graphics.drawable.LayerDrawable(
++                new android.graphics.drawable.Drawable[]{glow, inner});
++        int in = Math.round(px * 6);
++        ld.setLayerInset(1, in, in, in, in);
++        return ld;
++    }
++
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/FlipClockView.java b/launcher/app/src/main/java/com/gathin/tvhome/FlipClockView.java
+new file mode 100644
+index 0000000..7c1f1f0
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/FlipClockView.java
+@@ -0,0 +1,219 @@
++package com.gathin.tvhome;
++
++import android.content.Context;
++import android.graphics.Camera;
++import android.graphics.Canvas;
++import android.graphics.Matrix;
++import android.graphics.Paint;
++import android.graphics.Rect;
++import android.graphics.RectF;
++import android.graphics.Typeface;
++import android.os.SystemClock;
++import android.view.View;
++
++import java.util.Calendar;
++
++/**
++ * Jam flip besar HH:MM:SS (24 jam) untuk screensaver, dibuat agar terbaca dari jarak jauh.
++ * Enam kartu angka dengan dua titik dua; angka yang berganti dibalik seperti jam flip mekanik:
++ * separuh atas angka lama jatuh ke bawah, lalu separuh bawah angka baru menutup.
++ *
++ * <p>Ukuran mengikuti lebar yang diberikan (lihat {@link #setDigitWidth}); tinggi kartu 1,45 x lebarnya.
++ * View hanya menggambar ulang selama ada kartu yang sedang dibalik, jadi ringan untuk TV 2 GB.
++ */
++public class FlipClockView extends View {
++
++    private static final long FLIP_MS = 520L;
++    private static final int CARD = 0xFF2B2B30;
++    private static final int CARD_SHADE = 0xFF232327;
++    private static final int DIGIT = 0xFFF2F2F4;
++    private static final int HINGE = 0xFF141416;
++    private static final int COLON = 0xFFB5B6B8;
++
++    private final Paint cardPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final Paint digitPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final Paint hingePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final Paint colonPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final Camera camera = new Camera();
++    private final Matrix matrix = new Matrix();
++    private final RectF card = new RectF();
++    private final Rect bounds = new Rect();
++
++    private final char[] shown = new char[6];
++    private final char[] previous = new char[6];
++    private final long[] flipStart = new long[6];
++
++    private float digitW = 200f, digitH = 290f, gapIn, gapColon, colonW, radius;
++    private boolean running;
++
++    private final Runnable second = new Runnable() {
++        @Override
++        public void run() {
++            if (!running) return;
++            updateTime(true);
++            // Tepat di pergantian detik berikutnya.
++            postDelayed(this, 1000L - (System.currentTimeMillis() % 1000L));
++        }
++    };
++
++    public FlipClockView(Context context) {
++        super(context);
++        Typeface face;
++        try {
++            face = context.getResources().getFont(R.font.outfit);
++        } catch (RuntimeException e) {
++            face = Typeface.DEFAULT_BOLD;
++        }
++        digitPaint.setTypeface(face);
++        digitPaint.setFontVariationSettings("'wght' 600");
++        digitPaint.setColor(DIGIT);
++        digitPaint.setTextAlign(Paint.Align.CENTER);
++        hingePaint.setColor(HINGE);
++        colonPaint.setColor(COLON);
++        updateTime(false);
++    }
++
++    /** Lebar satu kartu angka dalam piksel; semua ukuran lain mengikuti. */
++    public void setDigitWidth(float w) {
++        digitW = w;
++        digitH = w * 1.45f;
++        gapIn = w * 0.07f;
++        gapColon = w * 0.10f;
++        colonW = w * 0.22f;
++        radius = w * 0.09f;
++        digitPaint.setTextSize(digitH * 0.80f);
++        hingePaint.setStrokeWidth(Math.max(2f, digitH * 0.012f));
++        requestLayout();
++        invalidate();
++    }
++
++    /** Lebar total untuk lebar kartu {@code w}: 6 kartu, 3 celah dalam grup, 2 titik dua. */
++    public static float widthFor(float w) {
++        return 6f * w + 3f * (w * 0.07f) + 2f * (w * 0.22f + 2f * w * 0.10f);
++    }
++
++    public void start() {
++        if (running) return;
++        running = true;
++        updateTime(false);
++        removeCallbacks(second);
++        postDelayed(second, 1000L - (System.currentTimeMillis() % 1000L));
++    }
++
++    public void stop() {
++        running = false;
++        removeCallbacks(second);
++    }
++
++    private void updateTime(boolean animate) {
++        Calendar c = Calendar.getInstance();
++        String s = String.format(java.util.Locale.ROOT, "%02d%02d%02d",
++                c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE), c.get(Calendar.SECOND));
++        long now = SystemClock.uptimeMillis();
++        for (int i = 0; i < 6; i++) {
++            char ch = s.charAt(i);
++            if (shown[i] == ch) continue;
++            previous[i] = shown[i] == 0 ? ch : shown[i];
++            shown[i] = ch;
++            flipStart[i] = animate ? now : 0L;
++        }
++        invalidate();
++    }
++
++    @Override
++    protected void onMeasure(int widthSpec, int heightSpec) {
++        setMeasuredDimension(Math.round(widthFor(digitW)), Math.round(digitH));
++    }
++
++    @Override
++    protected void onDraw(Canvas canvas) {
++        long now = SystemClock.uptimeMillis();
++        boolean animating = false;
++        float x = 0f;
++        for (int i = 0; i < 6; i++) {
++            float p = flipStart[i] == 0L ? 1f : Math.min(1f, (now - flipStart[i]) / (float) FLIP_MS);
++            if (p < 1f) animating = true;
++            drawDigit(canvas, x, i, ease(p));
++            x += digitW;
++            if (i == 1 || i == 3) {
++                drawColon(canvas, x + gapColon);
++                x += gapColon * 2f + colonW;
++            } else if (i % 2 == 0) {
++                x += gapIn;
++            }
++        }
++        if (animating) postInvalidateOnAnimation();
++    }
++
++    private static float ease(float p) {
++        return p < 0.5f ? 2f * p * p : 1f - (float) Math.pow(-2f * p + 2f, 2) / 2f;
++    }
++
++    private void drawColon(Canvas canvas, float x) {
++        float r = colonW * 0.36f;
++        float cx = x + colonW / 2f;
++        canvas.drawCircle(cx, digitH * 0.33f, r, colonPaint);
++        canvas.drawCircle(cx, digitH * 0.67f, r, colonPaint);
++    }
++
++    private void drawDigit(Canvas canvas, float x, int i, float p) {
++        float mid = digitH / 2f;
++        String now = String.valueOf(shown[i]);
++        String old = String.valueOf(previous[i] == 0 ? shown[i] : previous[i]);
++        if (p >= 1f) {
++            half(canvas, x, now, true, CARD);
++            half(canvas, x, now, false, CARD_SHADE);
++        } else {
++            // Di belakang: atas angka baru, bawah angka lama.
++            half(canvas, x, now, true, CARD);
++            half(canvas, x, old, false, CARD_SHADE);
++            // Kartu yang sedang dibalik, berputar pada engsel tengah.
++            canvas.save();
++            float angle;
++            boolean top;
++            String flap;
++            if (p < 0.5f) {
++                angle = -180f * p;          // atas angka lama jatuh ke depan
++                top = true;
++                flap = old;
++            } else {
++                angle = 180f * (1f - p);    // bawah angka baru turun menutup
++                top = false;
++                flap = now;
++            }
++            camera.save();
++            camera.setLocation(0f, 0f, -digitH * 0.06f);
++            camera.rotateX(angle);
++            camera.getMatrix(matrix);
++            camera.restore();
++            float cx = x + digitW / 2f;
++            matrix.preTranslate(-cx, -mid);
++            matrix.postTranslate(cx, mid);
++            canvas.concat(matrix);
++            half(canvas, x, flap, top, top ? CARD : CARD_SHADE);
++            canvas.restore();
++        }
++        canvas.drawLine(x, mid, x + digitW, mid, hingePaint);
++    }
++
++    /** Separuh atas atau bawah satu kartu dengan angkanya. */
++    private void half(Canvas canvas, float x, String digit, boolean top, int color) {
++        float mid = digitH / 2f;
++        canvas.save();
++        if (top) canvas.clipRect(x, 0f, x + digitW, mid);
++        else canvas.clipRect(x, mid, x + digitW, digitH);
++        cardPaint.setColor(color);
++        card.set(x, 0f, x + digitW, digitH);
++        canvas.drawRoundRect(card, radius, radius, cardPaint);
++        digitPaint.getTextBounds("0", 0, 1, bounds);
++        float baseline = mid - bounds.exactCenterY();
++        canvas.drawText(digit, x + digitW / 2f, baseline, digitPaint);
++        canvas.restore();
++    }
++
++    @Override
++    protected void onDetachedFromWindow() {
++        stop();
++        super.onDetachedFromWindow();
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java b/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
+index 3cd391e..53c4308 100644
+--- a/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
++++ b/launcher/app/src/main/java/com/gathin/tvhome/MainActivity.java
+@@ -128,6 +128,8 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+     private View btnInputs;
+     private TextView btnWifi;
+     private TextView shamsiDate;
++    private TextView prayerLine;
++    private Config prayerCfg;
+     private boolean shamsi;
+     private String vpnApp;
+     private SpringAnimation springX, springY;
+@@ -233,12 +235,13 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+             updateShamsiDate();
+             updateWifiLabel();
+             refreshPlacesIfDue();
+-            handler.postDelayed(this, MINUTE_MS);
++            handler.postDelayed(this, untilNextMinute());
+         }
+     };
+ 
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
++        AdzanScheduler.scheduleNext(this);
+         super.onCreate(savedInstanceState);
+         setContentView(R.layout.activity_main);
+         density = getResources().getDisplayMetrics().density;
+@@ -293,6 +296,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         if (!cfg.showNetworkPill) btnWifi.setVisibility(View.GONE);
+         shamsiDate = findViewById(R.id.shamsiDate);
+         shamsi = cfg.shamsiDate;
++        prayerLine = findViewById(R.id.prayerLine);
++        if (cfg.prayerTimes) {
++            prayerCfg = cfg;
++            prayerLine.setVisibility(View.VISIBLE);
++        }
+         if (shamsi) {
+             shamsiDate.setVisibility(View.VISIBLE);
+             TextView date = findViewById(R.id.date);
+@@ -672,7 +680,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+         updateWifiLabel();
+         updateInputsButton();
+         startWallpaperRotation();
+-        handler.postDelayed(minuteTick, MINUTE_MS);
++        handler.postDelayed(minuteTick, untilNextMinute());
+         handler.removeCallbacks(cacheClean);
+         handler.postDelayed(cacheClean, CacheCleaner.IDLE_MS);
+         hiddenSinceResume = false;
+@@ -1458,8 +1466,17 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
+ 
+     // ---- top bar ---------------------------------------------------------------------------------
+ 
++    /** Sampai pergantian menit berikutnya (+0,5 dtk), agar hitung mundur sholat pas dengan jam. */
++    private static long untilNextMinute() {
++        return MINUTE_MS - System.currentTimeMillis() % MINUTE_MS + 500;
++    }
++
+     private void updateShamsiDate() {
+         if (shamsi) shamsiDate.setText(Shamsi.today());
++        if (prayerCfg != null) {
++            prayerLine.setText(PrayerTimes.nextLine(java.util.Calendar.getInstance(),
++                    prayerCfg.prayerLat, prayerCfg.prayerLng, prayerCfg.prayerIhtiyat));
++        }
+     }
+ 
+     /** Shows the Wi-Fi network name on the button when we can read it, otherwise the connection type. */
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/Penanggalan.java b/launcher/app/src/main/java/com/gathin/tvhome/Penanggalan.java
+new file mode 100644
+index 0000000..1c34163
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/Penanggalan.java
+@@ -0,0 +1,75 @@
++package com.gathin.tvhome;
++
++import android.icu.util.IslamicCalendar;
++import android.icu.util.ULocale;
++
++import java.util.Calendar;
++
++/**
++ * Penanggalan untuk screensaver: hari + pasaran Jawa ("Selasa Legi, 10 November 2026") dan
++ * tanggal Hijriyah ("1 Jumadil Akhir 1448 H"). Semua dihitung di TV tanpa internet.
++ *
++ * <p>Pasaran berputar tiap 5 hari. Patokan: 17 Agustus 1945 (Proklamasi) jatuh pada Jumat Legi,
++ * sehingga 1 Januari 1970 (hari ke-0) adalah Wage. Hijriyah memakai kalender Umm al-Qura bawaan
++ * Android; hasilnya bisa selisih sehari dengan penetapan Kemenag, karena itu ada {@code offsetHari}.
++ */
++final class Penanggalan {
++
++    private static final String[] HARI = {"Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"};
++    private static final String[] PASARAN = {"Legi", "Pahing", "Pon", "Wage", "Kliwon"};
++    private static final String[] BULAN = {"Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
++            "Agustus", "September", "Oktober", "November", "Desember"};
++    private static final String[] BULAN_HIJRI = {"Muharram", "Safar", "Rabiul Awal", "Rabiul Akhir",
++            "Jumadil Awal", "Jumadil Akhir", "Rajab", "Sya'ban", "Ramadhan", "Syawal", "Dzulqa'dah",
++            "Dzulhijjah"};
++
++    private Penanggalan() {}
++
++    /** "Wage", "Kliwon", ... untuk tanggal sipil {@code c}. */
++    static String pasaran(Calendar c) {
++        long epochDay = Math.floorDiv(localMillis(c), 86_400_000L);
++        return PASARAN[(int) Math.floorMod(epochDay + 3, 5L)];
++    }
++
++    /** "Selasa". */
++    static String hari(Calendar c) {
++        return HARI[c.get(Calendar.DAY_OF_WEEK) - 1];
++    }
++
++    /** "10 November 2026". */
++    static String tanggal(Calendar c) {
++        return c.get(Calendar.DAY_OF_MONTH) + " " + BULAN[c.get(Calendar.MONTH)] + " " + c.get(Calendar.YEAR);
++    }
++
++    /** "Waktu Indonesia Barat" untuk UTC+7, Tengah untuk +8, Timur untuk +9. */
++    static String zona(Calendar c) {
++        int h = (c.get(Calendar.ZONE_OFFSET) + c.get(Calendar.DST_OFFSET)) / 3_600_000;
++        return h == 8 ? "Waktu Indonesia Tengah" : h == 9 ? "Waktu Indonesia Timur" : "Waktu Indonesia Barat";
++    }
++
++    /** "WIB", "WITA" atau "WIT". */
++    static String zonaSingkat(Calendar c) {
++        int h = (c.get(Calendar.ZONE_OFFSET) + c.get(Calendar.DST_OFFSET)) / 3_600_000;
++        return h == 8 ? "WITA" : h == 9 ? "WIT" : "WIB";
++    }
++
++    /** "Selasa Legi, 10 November 2026". */
++    static String masehi(Calendar c) {
++        return HARI[c.get(Calendar.DAY_OF_WEEK) - 1] + " " + pasaran(c) + ", "
++                + c.get(Calendar.DAY_OF_MONTH) + " " + BULAN[c.get(Calendar.MONTH)] + " " + c.get(Calendar.YEAR);
++    }
++
++    /** "1 Jumadil Akhir 1448 H"; {@code offsetHari} menggeser hasil bila beda dengan Kemenag. */
++    static String hijriyah(Calendar c, int offsetHari) {
++        IslamicCalendar h = new IslamicCalendar(android.icu.util.TimeZone.getDefault(), ULocale.ROOT);
++        h.setCalculationType(IslamicCalendar.CalculationType.ISLAMIC_UMALQURA);
++        h.setTimeInMillis(c.getTimeInMillis());
++        if (offsetHari != 0) h.add(IslamicCalendar.DAY_OF_MONTH, offsetHari);
++        return h.get(IslamicCalendar.DAY_OF_MONTH) + " " + BULAN_HIJRI[h.get(IslamicCalendar.MONTH)]
++                + " " + h.get(IslamicCalendar.YEAR) + " H";
++    }
++
++    private static long localMillis(Calendar c) {
++        return c.getTimeInMillis() + c.get(Calendar.ZONE_OFFSET) + c.get(Calendar.DST_OFFSET);
++    }
++}
+diff --git a/launcher/app/src/main/java/com/gathin/tvhome/PrayerTimes.java b/launcher/app/src/main/java/com/gathin/tvhome/PrayerTimes.java
+new file mode 100644
+index 0000000..7c55737
+--- /dev/null
++++ b/launcher/app/src/main/java/com/gathin/tvhome/PrayerTimes.java
+@@ -0,0 +1,142 @@
++package com.gathin.tvhome;
++
++import java.util.Calendar;
++import java.util.TimeZone;
++
++/**
++ * Jadwal sholat dihitung di TV, tanpa internet, dengan kriteria Kemenag RI:
++ * Subuh 20°, Isya 18°, Ashar Syafi'i (bayangan 1×), Maghrib saat matahari terbenam,
++ * lalu ihtiyat (pengaman) beberapa menit, dibulatkan ke atas ke menit penuh.
++ * Rumus astronomi mengikuti PrayTimes.org (Hamid Zarrabi-Zadeh, LGPL/MIT-style).
++ */
++final class PrayerTimes {
++
++    static final String[] NAMES = {"Subuh", "Dzuhur", "Ashar", "Maghrib", "Isya"};
++    /** Lama "sekarang waktu X" tetap ditampilkan setelah waktunya masuk. */
++    static final int NOW_WINDOW_MIN = 15;
++
++    private PrayerTimes() {
++    }
++
++    /** Menit sejak tengah malam (waktu lokal) untuk lima waktu sholat pada tanggal {@code day}. */
++    static int[] forDay(Calendar day, double lat, double lng, int ihtiyatMin) {
++        TimeZone tz = day.getTimeZone();
++        Calendar noon = (Calendar) day.clone();
++        noon.set(Calendar.HOUR_OF_DAY, 12);
++        noon.set(Calendar.MINUTE, 0);
++        double tzHours = tz.getOffset(noon.getTimeInMillis()) / 3_600_000.0;
++        double jd = julian(day.get(Calendar.YEAR), day.get(Calendar.MONTH) + 1, day.get(Calendar.DAY_OF_MONTH))
++                - lng / (15.0 * 24.0);
++
++        // Dua putaran: putaran kedua memakai hasil pertama sebagai perkiraan, lebih tepat.
++        double[] t = {5, 12, 13, 18, 18};
++        for (int pass = 0; pass < 2; pass++) {
++            double[] p = new double[5];
++            for (int i = 0; i < 5; i++) p[i] = t[i] / 24.0;
++            t = new double[]{
++                    sunAngleTime(jd, 20.0, p[0], lat, true),
++                    midDay(jd, p[1]),
++                    asrTime(jd, 1, p[2], lat),
++                    sunAngleTime(jd, 0.833, p[3], lat, false),
++                    sunAngleTime(jd, 18.0, p[4], lat, false)};
++        }
++        int[] out = new int[5];
++        for (int i = 0; i < 5; i++) {
++            double h = t[i] + tzHours - lng / 15.0;
++            out[i] = (int) Math.ceil(h * 60.0 - 1e-6) + ihtiyatMin;
++        }
++        return out;
++    }
++
++    /** "04:12" */
++    static String hhmm(int minutes) {
++        minutes = ((minutes % 1440) + 1440) % 1440;
++        return String.format(java.util.Locale.ROOT, "%02d:%02d", minutes / 60, minutes % 60);
++    }
++
++    /**
++     * Baris untuk bar atas: "Ashar 15:02 · 1 j 12 m lagi", atau "Waktu Ashar · 15:02" selama
++     * {@link #NOW_WINDOW_MIN} menit setelah waktunya masuk.
++     */
++    static String nextLine(Calendar now, double lat, double lng, int ihtiyatMin) {
++        int[] today = forDay(now, lat, lng, ihtiyatMin);
++        int cur = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE);
++        for (int i = 0; i < 5; i++) {
++            if (cur >= today[i] && cur < today[i] + NOW_WINDOW_MIN) {
++                return "Waktu " + NAMES[i] + " · " + hhmm(today[i]);
++            }
++        }
++        for (int i = 0; i < 5; i++) {
++            if (today[i] > cur) return NAMES[i] + " " + hhmm(today[i]) + " · " + until(today[i] - cur);
++        }
++        Calendar tomorrow = (Calendar) now.clone();
++        tomorrow.add(Calendar.DAY_OF_MONTH, 1);
++        int subuh = forDay(tomorrow, lat, lng, ihtiyatMin)[0];
++        return NAMES[0] + " " + hhmm(subuh) + " · " + until(subuh + 1440 - cur);
++    }
++
++    /** Indeks waktu sholat berikutnya hari ini, atau -1 bila semua sudah lewat. */
++    static int nextIndex(int[] today, int curMin) {
++        for (int i = 0; i < 5; i++) if (today[i] > curMin) return i;
++        return -1;
++    }
++
++    private static String until(int minutes) {
++        int h = minutes / 60, m = minutes % 60;
++        if (h == 0) return m + " menit lagi";
++        return m == 0 ? h + " jam lagi" : h + " j " + m + " m lagi";
++    }
++
++    // --- astronomi -------------------------------------------------------------------------
++
++    private static double julian(int y, int m, int d) {
++        if (m <= 2) {
++            y -= 1;
++            m += 12;
++        }
++        double a = Math.floor(y / 100.0);
++        double b = 2 - a + Math.floor(a / 4.0);
++        return Math.floor(365.25 * (y + 4716)) + Math.floor(30.6001 * (m + 1)) + d + b - 1524.5;
++    }
++
++    /** {declination in degrees, equation of time in hours} */
++    private static double[] sunPosition(double jd) {
++        double d = jd - 2451545.0;
++        double g = fixAngle(357.529 + 0.98560028 * d);
++        double q = fixAngle(280.459 + 0.98564736 * d);
++        double l = fixAngle(q + 1.915 * dsin(g) + 0.020 * dsin(2 * g));
++        double e = 23.439 - 0.00000036 * d;
++        double ra = darctan2(dcos(e) * dsin(l), dcos(l)) / 15.0;
++        double eqt = q / 15.0 - fixHour(ra);
++        double decl = darcsin(dsin(e) * dsin(l));
++        return new double[]{decl, eqt};
++    }
++
++    private static double midDay(double jd, double t) {
++        double eqt = sunPosition(jd + t)[1];
++        return fixHour(12 - eqt);
++    }
++
++    private static double sunAngleTime(double jd, double angle, double t, double lat, boolean beforeNoon) {
++        double decl = sunPosition(jd + t)[0];
++        double noon = midDay(jd, t);
++        double x = (-dsin(angle) - dsin(decl) * dsin(lat)) / (dcos(decl) * dcos(lat));
++        x = Math.max(-1, Math.min(1, x));
++        double span = darccos(x) / 15.0;
++        return noon + (beforeNoon ? -span : span);
++    }
++
++    private static double asrTime(double jd, int factor, double t, double lat) {
++        double decl = sunPosition(jd + t)[0];
++        double angle = -Math.toDegrees(Math.atan(1.0 / (factor + Math.tan(Math.toRadians(Math.abs(lat - decl))))));
++        return sunAngleTime(jd, angle, t, lat, false);
++    }
++
++    private static double dsin(double d) { return Math.sin(Math.toRadians(d)); }
++    private static double dcos(double d) { return Math.cos(Math.toRadians(d)); }
++    private static double darcsin(double x) { return Math.toDegrees(Math.asin(x)); }
++    private static double darccos(double x) { return Math.toDegrees(Math.acos(x)); }
++    private static double darctan2(double y, double x) { return Math.toDegrees(Math.atan2(y, x)); }
++    private static double fixAngle(double a) { a = a - 360.0 * Math.floor(a / 360.0); return a < 0 ? a + 360 : a; }
++    private static double fixHour(double h) { h = h - 24.0 * Math.floor(h / 24.0); return h < 0 ? h + 24 : h; }
++}
+diff --git a/launcher/app/src/main/res/layout/activity_main.xml b/launcher/app/src/main/res/layout/activity_main.xml
+index 75d357d..88eaac1 100644
+--- a/launcher/app/src/main/res/layout/activity_main.xml
++++ b/launcher/app/src/main/res/layout/activity_main.xml
+@@ -182,6 +182,24 @@
+                 </LinearLayout>
+             </LinearLayout>
+ 
++            <!-- Waktu sholat berikutnya ("Ashar 15:02 · 1 j 12 m lagi"), di bawah jam, bila prayer_times aktif. -->
++            <TextView
++                android:id="@+id/prayerLine"
++                android:layout_width="wrap_content"
++                android:layout_height="wrap_content"
++                android:layout_below="@id/leftBlock"
++                android:layout_alignParentStart="true"
++                android:layout_marginTop="2dp"
++                android:gravity="left"
++                android:singleLine="true"
++                android:textColor="#FFF2CD7A"
++                android:textSize="17sp"
++                android:fontFamily="@font/outfit"
++                android:fontVariationSettings="'wght' 500"
++                android:letterSpacing="0.03"
++                android:includeFontPadding="false"
++                android:visibility="gone" />
++
+             <LinearLayout
+                 android:id="@+id/topButtons"
+                 android:layout_width="wrap_content"
+diff --git a/launcher/app/src/main/res/layout/dream_clock.xml b/launcher/app/src/main/res/layout/dream_clock.xml
+index 3c8cf06..f2617fb 100644
+--- a/launcher/app/src/main/res/layout/dream_clock.xml
++++ b/launcher/app/src/main/res/layout/dream_clock.xml
+@@ -1,60 +1,7 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<!-- Screensaver (ClockDream): a grey analog clock with the time and date beneath, drifting a little each
+-     minute, on the same grey as the clock's face. ClockDream adds the dial and sizes everything to the
+-     screen's height. -->
++<!-- Screensaver (ClockDream): latar, jam flip, hitung mundur, dan jadwal sholat dibangun di ClockDream. -->
+ <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:id="@+id/dreamRoot"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+-    android:background="#FF1F1F22">
+-
+-    <LinearLayout
+-        android:id="@+id/dreamContent"
+-        android:layout_width="wrap_content"
+-        android:layout_height="wrap_content"
+-        android:gravity="center_horizontal"
+-        android:orientation="vertical">
+-
+-        <LinearLayout
+-            android:id="@+id/dreamTimeRow"
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:orientation="horizontal"
+-            android:baselineAligned="false">
+-
+-            <TextClock
+-                android:id="@+id/dreamTime"
+-                android:layout_width="wrap_content"
+-                android:layout_height="wrap_content"
+-                android:format12Hour="h:mm"
+-                android:format24Hour="HH:mm"
+-                android:textColor="#FFD4D4D6"
+-                android:fontFamily="@font/outfit"
+-                android:fontVariationSettings="'wght' 500"
+-                android:includeFontPadding="false" />
+-
+-            <!-- Top-aligned to the digits: ClockDream lines up the tops of the letters. -->
+-            <TextClock
+-                android:id="@+id/dreamAmPm"
+-                android:layout_width="wrap_content"
+-                android:layout_height="wrap_content"
+-                android:format12Hour="a"
+-                android:format24Hour=""
+-                android:textColor="#FFB5B6B8"
+-                android:fontFamily="@font/outfit"
+-                android:fontVariationSettings="'wght' 500"
+-                android:includeFontPadding="false"
+-                android:textAllCaps="true" />
+-        </LinearLayout>
+-
+-        <TextClock
+-            android:id="@+id/dreamDate"
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:textColor="#FF8B8C90"
+-            android:fontFamily="@font/outfit"
+-            android:fontVariationSettings="'wght' 400"
+-            android:letterSpacing="0.14"
+-            android:textAllCaps="true"
+-            android:includeFontPadding="false" />
+-    </LinearLayout>
+-</FrameLayout>
++    android:background="#FF0A0F1C" />
+diff --git a/launcher/app/src/main/res/raw/keep.xml b/launcher/app/src/main/res/raw/keep.xml
+new file mode 100644
+index 0000000..9a1cf5f
+--- /dev/null
++++ b/launcher/app/src/main/res/raw/keep.xml
+@@ -0,0 +1,3 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- adzan.mp3 dipanggil lewat getIdentifier (file disediakan pengguna), jadi jangan dibuang saat build. -->
++<resources xmlns:tools="http://schemas.android.com/tools" tools:keep="@raw/adzan,@raw/pengumuman" />
+diff --git a/launcher/app/src/main/res/raw/pengumuman.ogg b/launcher/app/src/main/res/raw/pengumuman.ogg
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c810e591af0fc1434b95cae6d60b1ed9d0f242d
+GIT binary patch
+literal 57963
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/launcher/app/src/main/res/values/config.xml b/launcher/app/src/main/res/values/config.xml
+index 60f29ef..fa82415 100644
+--- a/launcher/app/src/main/res/values/config.xml
++++ b/launcher/app/src/main/res/values/config.xml
+@@ -11,10 +11,20 @@
+          (no leanback entry) shows only when it is listed here. -->
+     <string-array name="dock_apps">
+         <item>com.google.android.youtube.tv</item>
+-        <item>in.startv.hotstar.dplus.tv</item>
+-        <item>com.crunchyroll.crunchyroid</item>
+-        <item>com.apple.atve.androidtv.appletv</item>
++        <item>com.netflix.ninja</item>
++        <item>com.amazon.amazonvideo.livingroom</item>
++        <item>com.sony.dtv.tvx</item>
+     </string-array>
++    <!-- Jadwal sholat (kriteria Kemenag, dihitung di TV tanpa internet): baris waktu sholat berikutnya
++         di bawah jam, dan lima waktu di screensaver. Lokasi bisa diganti lewat config.json:
++         "prayer_city", "prayer_lat", "prayer_lng", "prayer_ihtiyat_minutes", atau "prayer_times": false. -->
++    <bool name="prayer_times">true</bool>
++    <string name="prayer_city" translatable="false">Malang</string>
++    <string name="prayer_lat" translatable="false">-7.9666</string>
++    <string name="prayer_lng" translatable="false">112.6326</string>
++    <integer name="prayer_ihtiyat_minutes">2</integer>
++    <!-- Geser tanggal Hijriyah (hari) bila berbeda dengan penetapan Kemenag, misalnya -1 atau 1. -->
++    <integer name="hijri_offset_days">0</integer>
+ 
+     <!-- Apps never shown as tiles (e.g. the Live TV app, which the Inputs menu already covers). -->
+     <string-array name="hidden_apps">
+@@ -78,5 +88,6 @@
+          true keeps the GPU drawing path but calms the movement: a stiff highlight spring with no bounce,
+          tiles that zoom without overshoot, shorter fades and no tile entrance when Home comes back. Set it
+          here or with "reduced_motion": true in a theme's config.json; false keeps the normal motion. -->
+-    <bool name="reduced_motion">false</bool>
++    <!-- Mi Box 3 (Mali-450, RAM 2 GB): gerakan lebih tenang secara default. -->
++    <bool name="reduced_motion">true</bool>
+ </resources>
